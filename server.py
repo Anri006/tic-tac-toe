@@ -1,10 +1,10 @@
 import asyncio
 import json
 import os
-import websockets
+from aiohttp import web
 
 CONNECTED = set()
-GAMES = {}  # room_id: game_state
+GAMES = {}  # ws: (game, opponent_ws)
 
 
 class Game:
@@ -36,39 +36,41 @@ class Game:
 waiting_player = None
 
 
-async def handler(websocket):
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
     global waiting_player
-    CONNECTED.add(websocket)
+    CONNECTED.add(ws)
 
     try:
-        # Поиск пары для игры
+        # Логика поиска соперника
         if waiting_player is None:
-            waiting_player = websocket
-            await websocket.send(
+            waiting_player = ws
+            await ws.send_str(
                 json.dumps({
                     "type": "waiting",
                     "msg": "Ожидание второго игрока..."
                 }))
-            while waiting_player == websocket:
+            while waiting_player == ws:
                 await asyncio.sleep(0.5)
         else:
             p1 = waiting_player
-            p2 = websocket
+            p2 = ws
             waiting_player = None
 
             game = Game(p1, p2)
             GAMES[p1] = (game, p2)
             GAMES[p2] = (game, p1)
 
-            # Оповещаем игроков о начале
-            await p1.send(
+            await p1.send_str(
                 json.dumps({
                     "type": "init",
                     "symbol": "X",
                     "turn": "X",
                     "board": game.board
                 }))
-            await p2.send(
+            await p2.send_str(
                 json.dumps({
                     "type": "init",
                     "symbol": "O",
@@ -77,12 +79,12 @@ async def handler(websocket):
                 }))
 
         # Обработка сообщений от клиента
-        async for message in websocket:
-            data = json.loads(message)
-            if data["type"] == "move":
-                if websocket in GAMES:
-                    game, opponent = GAMES[websocket]
-                    symbol = game.players[websocket]
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                if data.get("type") == "move" and ws in GAMES:
+                    game, opponent = GAMES[ws]
+                    symbol = game.players[ws]
 
                     if game.make_move(data["index"], symbol):
                         winner = game.check_winner()
@@ -92,24 +94,27 @@ async def handler(websocket):
                             "turn": game.turn,
                             "winner": winner,
                         }
-                        await websocket.send(json.dumps(state))
-                        await opponent.send(json.dumps(state))
+                        await ws.send_str(json.dumps(state))
+                        await opponent.send_str(json.dumps(state))
 
-    except websockets.ConnectionClosed:
-        pass
+    except Exception as e:
+        print(f"Ошибка WebSocket: {e}")
     finally:
-        CONNECTED.remove(websocket)
-        if waiting_player == websocket:
+        CONNECTED.remove(ws)
+        if waiting_player == ws:
             waiting_player = None
+        if ws in GAMES:
+            _, opponent = GAMES[ws]
+            del GAMES[ws]
+
+    return ws
 
 
-async def main():
-    # Render передает порт в переменной окружения PORT
-    port = int(os.environ.get("PORT", 8765))
-    async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Сервер запущен на порту {port}")
-        await asyncio.Future()  # Бесконечный цикл
-
+# Принимаем соединения и на главный роут, и на /ws
+app = web.Application()
+app.router.add_get("/", websocket_handler)
+app.router.add_get("/ws", websocket_handler)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 8765))
+    web.run_app(app, host="0.0.0.0", port=port)
